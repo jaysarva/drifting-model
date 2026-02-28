@@ -5,7 +5,7 @@ Implements the core V computation for training drifting models.
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 
 def compute_V(
@@ -14,7 +14,8 @@ def compute_V(
     y_neg: torch.Tensor,
     temperature: float,
     mask_self: bool = True,
-) -> torch.Tensor:
+    return_dist_stats: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
     """
     Compute the drifting field V (Algorithm 2 from paper, Page 12).
 
@@ -26,9 +27,12 @@ def compute_V(
         y_neg: Negative (generated) samples, shape (N_neg, D)
         temperature: Temperature for softmax (smaller = sharper)
         mask_self: Whether to mask self-distances (when y_neg == x)
+        return_dist_stats: If True, also return mean/variance of pairwise
+            distances used to form logits.
 
     Returns:
         V: Drifting field, shape (N, D)
+        stats (optional): Feature distance mean/variance.
     """
     N = x.shape[0]
     N_pos = y_pos.shape[0]
@@ -38,6 +42,14 @@ def compute_V(
     # 1. Compute pairwise L2 distances
     dist_pos = torch.cdist(x, y_pos, p=2)  # (N, N_pos)
     dist_neg = torch.cdist(x, y_neg, p=2)  # (N, N_neg)
+
+    dist_stats = None
+    if return_dist_stats:
+        all_dists = torch.cat([dist_pos.reshape(-1), dist_neg.reshape(-1)], dim=0)
+        dist_stats = {
+            "feature_dist_mean": all_dists.mean().item(),
+            "feature_dist_var": all_dists.var(unbiased=False).item(),
+        }
 
     # 2. Mask self-distances (when y_neg contains x)
     if mask_self and N == N_neg:
@@ -70,6 +82,8 @@ def compute_V(
 
     V = drift_pos - drift_neg
 
+    if return_dist_stats:
+        return V, dist_stats
     return V
 
 

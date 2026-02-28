@@ -5,6 +5,7 @@ Includes EMA, learning rate scheduling, visualization, and checkpointing.
 
 import copy
 import math
+import random
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -108,6 +109,7 @@ def save_checkpoint(
     epoch: int,
     step: int,
     config: Dict[str, Any],
+    metrics: Optional[Dict[str, Any]] = None,
 ):
     """Save training checkpoint."""
     checkpoint = {
@@ -119,6 +121,8 @@ def save_checkpoint(
         "step": step,
         "config": config,
     }
+    if metrics is not None:
+        checkpoint["metrics"] = metrics
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
 
@@ -343,11 +347,26 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
+def set_seed(seed: int, deterministic_debug: bool = False):
+    """
+    Set random seed for reproducibility.
+
+    Args:
+        seed: Global seed.
+        deterministic_debug: If True, enable deterministic CuDNN behavior.
+            This is useful for debugging, but can reduce performance.
+    """
+    random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+
+    if deterministic_debug and torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 @torch.no_grad()

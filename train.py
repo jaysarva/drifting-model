@@ -9,19 +9,16 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from model import DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
-from drifting import (
-    compute_V,
-    normalize_features,
-    normalize_drift,
-)
-from feature_encoder import create_feature_encoder, pretrain_mae
+from model import DriftDiT_models
+from drifting import compute_V
+from feature_encoder import create_feature_encoder
 from utils import (
     EMA,
     WarmupLRScheduler,
@@ -80,7 +77,96 @@ CIFAR10_CONFIG = {
 }
 
 
-def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> tuple:
+DEFAULT_DATA_ROOT = "/home/qingtianzhu.ty/drifting/data"
+
+
+def load_yaml_config(path: Path) -> Dict[str, Any]:
+    """Load YAML config file."""
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected mapping in YAML config: {path}")
+    return data
+
+
+def load_training_config(dataset: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+    """Load dataset config from defaults + YAML overrides."""
+    dataset_key = dataset.lower()
+    if dataset_key == "cifar":
+        dataset_key = "cifar10"
+    if dataset_key not in {"mnist", "cifar10"}:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    config = (MNIST_CONFIG if dataset_key == "mnist" else CIFAR10_CONFIG).copy()
+    path = (
+        Path(config_path)
+        if config_path is not None
+        else Path(__file__).resolve().parent / "configs" / f"{dataset_key}.yaml"
+    )
+
+    if path.exists():
+        config.update(load_yaml_config(path))
+    elif config_path is not None:
+        raise FileNotFoundError(f"Config path does not exist: {path}")
+
+    return config
+
+
+class StructuredLogger:
+    """Structured metric logging backend (W&B)."""
+
+    def __init__(
+        self,
+        backend: str,
+        output_dir: Path,
+        config: Dict[str, Any],
+        dataset: str,
+        project: str,
+        run_name: Optional[str] = None,
+    ):
+        self.backend = backend
+        self._wandb = None
+        self.run = None
+
+        if backend == "none":
+            return
+        if backend != "wandb":
+            raise ValueError(f"Unknown logger backend: {backend}")
+
+        try:
+            import wandb
+        except ImportError:
+            print("wandb is not installed. Structured logging is disabled.")
+            self.backend = "none"
+            return
+
+        resolved_run_name = run_name or f"{dataset}-{int(time.time())}"
+        self._wandb = wandb
+        try:
+            self.run = wandb.init(
+                project=project,
+                name=resolved_run_name,
+                config=config,
+                dir=str(output_dir),
+                reinit=True,
+            )
+        except Exception as exc:
+            print(f"wandb init failed ({exc}). Structured logging is disabled.")
+            self.backend = "none"
+            self.run = None
+
+    def log(self, metrics: Dict[str, float], step: int):
+        if self.run is None:
+            return
+        self._wandb.log(metrics, step=step)
+
+    def close(self):
+        if self.run is not None:
+            self._wandb.finish()
+            self.run = None
+
+
+def get_dataset(name: str, root: str = DEFAULT_DATA_ROOT) -> tuple:
     """Get dataset and transforms."""
     if name.lower() == "mnist":
         # MNIST data is at {root}/mnist/MNIST/raw/
@@ -90,8 +176,8 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),  # [-1, 1]
         ])
-        train_dataset = datasets.MNIST(mnist_root, train=True, download=False, transform=transform)
-        test_dataset = datasets.MNIST(mnist_root, train=False, download=False, transform=transform)
+        train_dataset = datasets.MNIST(mnist_root, train=True, download=True, transform=transform)
+        test_dataset = datasets.MNIST(mnist_root, train=False, download=True, transform=transform)
     elif name.lower() in ["cifar10", "cifar"]:
         transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
@@ -178,6 +264,8 @@ def compute_drifting_loss(
 
     total_loss = torch.tensor(0.0, device=device, requires_grad=True)
     total_drift_norm = 0.0
+    total_feature_dist_mean = 0.0
+    total_feature_dist_var = 0.0
     num_losses = 0
 
     # Compute loss per class
@@ -189,7 +277,7 @@ def compute_drifting_loss(
             continue
 
         # Compute loss at each scale
-        for scale_idx, (feat_gen, feat_pos) in enumerate(zip(feat_gen_list, feat_pos_list)):
+        for feat_gen, feat_pos in zip(feat_gen_list, feat_pos_list):
             feat_gen_c = feat_gen[mask_gen]
             feat_pos_c = feat_pos[mask_pos]
 
@@ -203,14 +291,25 @@ def compute_drifting_loss(
 
             # Compute V with multiple temperatures
             V_total = torch.zeros_like(feat_gen_c_norm)
-            for tau in temperatures:
-                V_tau = compute_V(
-                    feat_gen_c_norm,
-                    feat_pos_c_norm,
-                    feat_neg_c_norm,
-                    tau,
-                    mask_self=True,  # y_neg = x, so mask self
-                )
+            dist_stats = None
+            for tau_idx, tau in enumerate(temperatures):
+                if tau_idx == 0:
+                    V_tau, dist_stats = compute_V(
+                        feat_gen_c_norm,
+                        feat_pos_c_norm,
+                        feat_neg_c_norm,
+                        tau,
+                        mask_self=True,  # y_neg = x, so mask self
+                        return_dist_stats=True,
+                    )
+                else:
+                    V_tau = compute_V(
+                        feat_gen_c_norm,
+                        feat_pos_c_norm,
+                        feat_neg_c_norm,
+                        tau,
+                        mask_self=True,  # y_neg = x, so mask self
+                    )
                 # Normalize each V before summing
                 v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
                 V_tau = V_tau / (v_norm + 1e-8)
@@ -222,15 +321,25 @@ def compute_drifting_loss(
 
             total_loss = total_loss + loss_scale
             total_drift_norm += (V_total ** 2).mean().item() ** 0.5
+            if dist_stats is not None:
+                total_feature_dist_mean += dist_stats["feature_dist_mean"]
+                total_feature_dist_var += dist_stats["feature_dist_var"]
             num_losses += 1
 
     if num_losses == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {"loss": 0.0, "drift_norm": 0.0}
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0,
+            "drift_norm": 0.0,
+            "feature_dist_mean": 0.0,
+            "feature_dist_var": 0.0,
+        }
 
     loss = total_loss / num_losses
     info = {
         "loss": loss.item(),
         "drift_norm": total_drift_norm / num_losses,
+        "feature_dist_mean": total_feature_dist_mean / num_losses,
+        "feature_dist_var": total_feature_dist_var / num_losses,
     }
 
     return loss, info
@@ -335,19 +444,29 @@ def fill_queue(
 def train(
     dataset: str = "mnist",
     output_dir: str = "./outputs",
+    config_path: Optional[str] = None,
+    data_root: str = DEFAULT_DATA_ROOT,
     resume: Optional[str] = None,
     seed: int = 42,
+    deterministic_debug: bool = False,
     num_workers: int = 4,
+    logger_backend: str = "wandb",
+    wandb_project: str = "drifting-model",
+    wandb_run_name: Optional[str] = None,
     log_interval: int = 100,
     save_interval: int = 10,
     sample_interval: int = 10,
 ):
     """Main training function."""
-    set_seed(seed)
+    set_seed(seed, deterministic_debug=deterministic_debug)
+    if deterministic_debug:
+        print("Deterministic debug mode enabled: CuDNN deterministic=True, benchmark=False")
 
     # Get config
-    config = MNIST_CONFIG.copy() if dataset.lower() == "mnist" else CIFAR10_CONFIG.copy()
+    config = load_training_config(dataset, config_path=config_path)
     config["dataset"] = dataset
+    config["seed"] = seed
+    config["deterministic_debug"] = deterministic_debug
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -357,8 +476,17 @@ def train(
     output_dir = Path(output_dir) / dataset
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    logger = StructuredLogger(
+        backend=logger_backend,
+        output_dir=output_dir,
+        config=config,
+        dataset=dataset,
+        project=wandb_project,
+        run_name=wandb_run_name,
+    )
+
     # Load dataset
-    train_dataset, test_dataset = get_dataset(dataset)
+    train_dataset, _ = get_dataset(dataset, root=data_root)
     train_loader = DataLoader(
         train_dataset,
         batch_size=256,
@@ -391,7 +519,6 @@ def train(
     )
 
     # Create scheduler
-    steps_per_epoch = len(train_loader)
     scheduler = WarmupLRScheduler(
         optimizer,
         warmup_steps=config["warmup_steps"],
@@ -427,10 +554,18 @@ def train(
     # Resume from checkpoint
     start_epoch = 0
     global_step = 0
+    last_step_metrics: Dict[str, float] = {}
+    last_epoch_metrics: Dict[str, float] = {}
     if resume:
         checkpoint = load_checkpoint(resume, model, ema, optimizer, scheduler)
         start_epoch = checkpoint["epoch"] + 1
         global_step = checkpoint["step"]
+        if isinstance(checkpoint.get("metrics"), dict):
+            metrics = checkpoint["metrics"]
+            if isinstance(metrics.get("step"), dict):
+                last_step_metrics = dict(metrics["step"])
+            if isinstance(metrics.get("epoch"), dict):
+                last_epoch_metrics = dict(metrics["epoch"])
         print(f"Resumed from epoch {start_epoch}, step {global_step}")
 
     # Training loop
@@ -477,16 +612,38 @@ def train(
             epoch_drift_norm += info["drift_norm"]
             num_batches += 1
             global_step += 1
+            lr = scheduler.get_lr()
+
+            logger.log(
+                {
+                    "train/loss": info["loss"],
+                    "train/drift_norm": info["drift_norm"],
+                    "train/grad_norm": info["grad_norm"],
+                    "train/feature_dist_mean": info["feature_dist_mean"],
+                    "train/feature_dist_var": info["feature_dist_var"],
+                    "train/lr": lr,
+                },
+                step=global_step,
+            )
+            last_step_metrics = {
+                "loss": info["loss"],
+                "drift_norm": info["drift_norm"],
+                "grad_norm": info["grad_norm"],
+                "feature_dist_mean": info["feature_dist_mean"],
+                "feature_dist_var": info["feature_dist_var"],
+                "lr": lr,
+            }
 
             # Logging
             if global_step % log_interval == 0:
-                lr = scheduler.get_lr()
                 print(
                     f"Epoch {epoch+1}/{config['epochs']} | "
                     f"Step {global_step} | "
                     f"Loss: {info['loss']:.4f} | "
                     f"Drift: {info['drift_norm']:.4f} | "
                     f"Grad: {info['grad_norm']:.4f} | "
+                    f"DistMean: {info['feature_dist_mean']:.4f} | "
+                    f"DistVar: {info['feature_dist_var']:.4f} | "
                     f"LR: {lr:.6f}"
                 )
 
@@ -506,6 +663,11 @@ def train(
         epoch_time = time.time() - epoch_start
         avg_loss = epoch_loss / max(num_batches, 1)
         avg_drift = epoch_drift_norm / max(num_batches, 1)
+        last_epoch_metrics = {
+            "loss": avg_loss,
+            "drift_norm": avg_drift,
+            "num_batches": float(num_batches),
+        }
         print(
             f"\nEpoch {epoch+1} completed in {epoch_time:.1f}s | "
             f"Avg Loss: {avg_loss:.4f} | "
@@ -524,6 +686,10 @@ def train(
                 epoch,
                 global_step,
                 config,
+                metrics={
+                    "step": last_step_metrics,
+                    "epoch": last_epoch_metrics,
+                },
             )
             print(f"Saved checkpoint to {ckpt_path}")
 
@@ -550,7 +716,12 @@ def train(
         config["epochs"] - 1,
         global_step,
         config,
+        metrics={
+            "step": last_step_metrics,
+            "epoch": last_epoch_metrics,
+        },
     )
+    logger.close()
     print(f"Training complete! Final checkpoint saved to {final_path}")
 
 
@@ -602,6 +773,18 @@ def main():
         help="Output directory",
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML config file (overrides dataset defaults)",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=DEFAULT_DATA_ROOT,
+        help="Dataset root directory",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -618,6 +801,30 @@ def main():
         type=int,
         default=4,
         help="Number of data loading workers",
+    )
+    parser.add_argument(
+        "--deterministic_debug",
+        action="store_true",
+        help="Enable deterministic torch/cudnn behavior for debugging (slower).",
+    )
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="wandb",
+        choices=["wandb", "none"],
+        help="Structured logger backend",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="drifting-model",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name",
     )
     parser.add_argument(
         "--log_interval",
@@ -643,9 +850,15 @@ def main():
     train(
         dataset=args.dataset,
         output_dir=args.output_dir,
+        config_path=args.config,
+        data_root=args.data_root,
         resume=args.resume,
         seed=args.seed,
+        deterministic_debug=args.deterministic_debug,
         num_workers=args.num_workers,
+        logger_backend=args.logger,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         sample_interval=args.sample_interval,

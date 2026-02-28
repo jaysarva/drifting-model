@@ -19,7 +19,7 @@ Key components:
 ## Requirements
 
 ```bash
-pip install torch torchvision einops
+pip install -r requirements.txt
 ```
 
 ## TODO
@@ -44,6 +44,21 @@ python train.py --dataset cifar10
 python sample.py --checkpoint outputs/mnist/checkpoint_final.pt --dataset mnist
 ```
 
+### Evaluation (CIFAR-10 FID)
+
+```bash
+# Evaluate one checkpoint (50k samples by default)
+python eval.py --checkpoint outputs/cifar10/checkpoint_final.pt --dataset cifar10
+
+# Evaluate all checkpoints in a directory and append rows to CSV
+python eval.py --checkpoint_dir outputs/cifar10 --dataset cifar10 --skip_existing
+```
+
+Outputs:
+- `eval/fid_metrics.csv` (one row per checkpoint: step, fid, loss, drift_norm, ...)
+- `eval/fid_vs_step.png` (baseline curve)
+- `eval/artifacts/<checkpoint>_step*/` (metadata, preview, generated samples unless `--cleanup_samples`)
+
 ## Results
 
 MNIST samples after ~8000 steps:
@@ -62,6 +77,7 @@ CIFAR-10 samples after ~8500 steps:
 ├── feature_encoder.py  # CNN feature encoder (for CIFAR)
 ├── train.py            # Training loop
 ├── sample.py           # Sampling script
+├── eval.py             # Checkpoint FID evaluation + curve export
 └── utils.py            # EMA, utilities
 ```
 
@@ -74,5 +90,4 @@ CIFAR-10 samples after ~8500 steps:
 | LR | 2e-4 | 2e-4 |
 | Temperatures | [0.02, 0.05, 0.2] | [0.02, 0.05, 0.2] |
 | Feature space | Pixel (L2 norm) | CNN encoder |
-
 
