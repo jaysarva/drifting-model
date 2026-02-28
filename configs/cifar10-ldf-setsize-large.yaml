@@ -3,8 +3,8 @@ img_size: 32
 in_channels: 3
 num_classes: 10
 batch_nc: 10
-batch_n_pos: 32
-batch_n_neg: 32
+batch_n_pos: 64
+batch_n_neg: 64
 temperatures: [0.02, 0.05, 0.2]
 lr: 0.0002
 weight_decay: 0.01
@@ -17,8 +17,8 @@ alpha_max: 3.0
 use_feature_encoder: true
 queue_size: 128
 label_dropout: 0.1
-field_type: kernel
-kernel_use_multi_temperature: true
+field_type: learned
+kernel_use_multi_temperature: false
 ldf_hidden_dim: 256
 ldf_projection_dim: 256
 ldf_score_hidden_dim: 128

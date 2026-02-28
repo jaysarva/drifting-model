@@ -14,7 +14,7 @@ warmup_steps: 500
 epochs: 50
 alpha_min: 1.0
 alpha_max: 3.0
-use_feature_encoder: true
+use_feature_encoder: false
 queue_size: 128
 label_dropout: 0.1
 field_type: kernel

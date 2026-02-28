@@ -17,3 +17,10 @@ alpha_max: 3.0
 use_feature_encoder: true
 queue_size: 128
 label_dropout: 0.1
+field_type: kernel
+kernel_use_multi_temperature: true
+ldf_hidden_dim: 256
+ldf_projection_dim: 256
+ldf_score_hidden_dim: 128
+ldf_use_projection: true
+ldf_mask_self_neg: true

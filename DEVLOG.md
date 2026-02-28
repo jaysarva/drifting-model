@@ -202,3 +202,241 @@ Evaluate a checkpoint directory and build baseline curve:
 ```bash
 python eval.py --checkpoint_dir outputs/cifar10 --dataset cifar10 --skip_existing
 ```
+
+## Day 2 (2026-02-28)
+
+### Summary
+Day 2 implemented **Learned Drifting Fields (LDF v0)** as a configurable drop-in replacement for the hand-designed kernel field, while preserving the core training invariant:
+
+- antisymmetric field construction
+- fixed-point stopgrad target (`target = (feat + V).detach()`)
+
+This adds a direct path to test whether learned set geometry can reduce dependence on encoder strength.
+
+---
+
+### What Changed
+
+#### 1. Added learned antisymmetric set operator (`learned_field.py`)
+
+Implemented:
+- `SetAttentionField`
+- `LearnedFieldBank`
+- `compute_V_learned(...)` functional wrapper
+
+Core construction:
+- `V(x; P, Q) = S(x, P) - S(x, Q)` (antisymmetric by design)
+
+Set operator details:
+- Optional projection `g = MLP(feat)` (toggleable)
+- Attention logits from:
+  - `[g(x), g(y), g(y)-g(x), ||g(y)-g(x)||]`
+- Softmax over the set
+- Output:
+  - weighted sum of `(g(y)-g(x))`
+  - projected back to feature dimension when projection is enabled
+
+Also added safe handling for singleton self-masked negatives to avoid invalid softmax states.
+
+#### 2. Training pipeline integration (`train.py`)
+
+Added config-controlled switch:
+- `field_type: kernel | learned`
+
+Added LDF-related config knobs:
+- `kernel_use_multi_temperature`
+- `ldf_hidden_dim`
+- `ldf_projection_dim`
+- `ldf_score_hidden_dim`
+- `ldf_use_projection`
+- `ldf_mask_self_neg`
+
+Behavioral changes:
+- `compute_drifting_loss(...)` now branches between:
+  - original kernel field
+  - learned field (`learned_field.compute_V_learned(...)`)
+- LDF path keeps the same stopgrad target as baseline.
+- Kernel multi-temperature remains available for baseline.
+- When `field_type=learned`, multi-temperature kernel mixing is disabled in config to avoid confounds.
+
+Optimization changes:
+- LDF parameters are added to the optimizer parameter list.
+- Gradient clipping now includes both model + LDF params.
+
+#### 3. Checkpoint compatibility (`utils.py`, `train.py`)
+
+Extended checkpoint saving with optional `extra_state`.
+Used to persist:
+- `learned_field` state dict (only when LDF is active)
+
+Resume behavior:
+- If training with LDF and checkpoint contains `learned_field`, it is restored.
+- If missing, training warns and continues with freshly initialized LDF weights.
+
+#### 4. Config and ablation setup (`configs/`)
+
+Updated baseline configs to include field/LDF keys:
+- `configs/mnist.yaml`
+- `configs/cifar10.yaml`
+- `configs/cifar10-short.yaml`
+
+Added dedicated LDF ablation configs:
+- `configs/cifar10-ldf.yaml` (learned attention + projection)
+- `configs/cifar10-ldf-no-proj.yaml` (without `g()` projection)
+- `configs/cifar10-ldf-setsize-small.yaml` (`Npos=Nneg=16`)
+- `configs/cifar10-ldf-setsize-large.yaml` (`Npos=Nneg=64`)
+
+Aligned these LDF configs to the existing short-baseline budget for fair comparison with `configs/cifar10-short.yaml`:
+- `epochs: 50`
+- `warmup_steps: 500`
+
+These directly cover requested ablations:
+- learned attention vs fixed kernel
+- with/without projection
+- set size sensitivity
+
+#### 5. Tests for antisymmetry and basic correctness (`tests/test_learned_field.py`)
+
+Added tests for:
+- antisymmetry with projection
+- antisymmetry without projection
+- finite output for singleton self-masked negatives
+- multi-scale bank output shape sanity
+
+#### 6. Documentation update (`README.md`)
+
+Added:
+- LDF mention in method summary
+- training command for LDF config
+- ablation command examples
+
+#### 7. Test runner compatibility fix (`__init__.py`)
+
+Fixed `pytest` collection failure caused by importing repo-root `__init__.py` as a top-level module.
+
+Change:
+- Added dual import path support in `__init__.py`:
+  - package-relative imports when imported as a package
+  - local absolute imports fallback for top-level import contexts
+
+Result:
+- tests now run successfully inside `/.venv`.
+
+#### 8. Automated LDF verification script (`scripts/run_ldf_verification.sh`)
+
+Added an end-to-end script that runs the short-budget LDF comparison matrix (single seed, matching baseline seed 42):
+
+- `ldf_short` (learned attention + projection)
+- `ldf_no_proj_short` (projection ablation)
+- `ldf_set_small_short` (`Npos/Nneg=16`)
+- `ldf_set_large_short` (`Npos/Nneg=64`)
+
+Design choices in script:
+- Activates `/.venv` at start.
+- Uses fixed logging backend:
+  - `--logger wandb`
+  - `--wandb_project drifting-model`
+- Writes eval outputs to run-specific directories under:
+  - `eval/ldf_verification_<RUN_TAG>/...`
+- Cleans disk usage after each experiment:
+  - deletes `<eval_run>/artifacts/`
+  - deletes corresponding training output directory under `outputs/...`
+- Assumes kernel short baseline already exists and therefore does **not** rerun kernel.
+
+#### 9. Short CIFAR run without feature encoder (`configs/cifar10-short-no-encoder.yaml`, `scripts/run_cifar10_short_no_encoder.sh`)
+
+Added a short-budget kernel config that matches the prior CIFAR short baseline except:
+- `use_feature_encoder: false`
+
+Also added a dedicated train+eval script to run this comparison first:
+- `scripts/run_cifar10_short_no_encoder.sh`
+
+Script behavior:
+- Activates `/.venv`
+- Trains CIFAR-10 short run with no feature encoder (seed 42 by default)
+- Evaluates with `eval.py` into run-specific `eval/...` directory
+- Deletes eval `artifacts/` to reduce disk usage
+- Keeps training outputs/checkpoints for inspection and potential resume
+
+---
+
+### Baseline Eval Analysis (`configs/cifar10-short.yaml`, produced with `eval.py`)
+
+Evaluated checkpoints (EMA, clean-fid, CIFAR-10 train split, 50k generated samples, `alpha=1.5`, `seed=42`):
+
+- step 1950 (epoch 10): FID **155.97**
+- step 3900 (epoch 20): FID **102.59**
+- step 5850 (epoch 30): FID **97.63**
+- step 7800 (epoch 40): FID **88.67**
+- step 9750 (epoch 50): FID **79.92**
+
+Curve behavior (`eval_cifar10-short/fid_vs_step.png`):
+- Monotonic decrease across all measured checkpoints.
+- Very large early gain from 1950 -> 3900 (about **-53.38 FID**).
+- After that, improvements continue but at a slower rate (roughly **-5 to -9 FID** every 1950 steps).
+- Net improvement over short run: **-76.05 FID** (about **48.8%** reduction vs step 1950).
+
+Additional notes from `eval_cifar10-short/fid_metrics.csv`:
+- `checkpoint_epoch50.pt` and `checkpoint_final.pt` have identical `step=9750` and identical FID (**79.92**), which is expected since they represent the same terminal training state.
+- Training-side metrics (`loss`, `drift_norm`) change only modestly while FID improves substantially, indicating those internal statistics are not strongly predictive of sample quality in this run.
+
+Interpretation:
+- The baseline is clearly learning in the short schedule and has not plateaued hard by step 9750.
+- The final short-run FID (~80) is still far from strong CIFAR baselines, so there is headroom for architectural/operator improvements (including LDF) and/or longer training.
+
+---
+
+### Validation Performed
+
+- `python -m compileall .` passed.
+- In `/.venv`, `pytest -q tests/test_learned_field.py` passed (`4 passed`).
+- In `/.venv`, `pytest -q` passed (`4 passed`).
+
+---
+
+### Files Added / Updated
+
+Added:
+- `learned_field.py`
+- `tests/test_learned_field.py`
+- `configs/cifar10-ldf.yaml`
+- `configs/cifar10-ldf-no-proj.yaml`
+- `configs/cifar10-ldf-setsize-small.yaml`
+- `configs/cifar10-ldf-setsize-large.yaml`
+- `configs/cifar10-short-no-encoder.yaml`
+- `scripts/run_ldf_verification.sh`
+- `scripts/run_cifar10_short_no_encoder.sh`
+
+Updated:
+- `train.py`
+- `utils.py`
+- `README.md`
+- `__init__.py`
+- `configs/mnist.yaml`
+- `configs/cifar10.yaml`
+- `configs/cifar10-short.yaml`
+
+---
+
+### Next Measurement Step
+
+1. Run the short no-feature-encoder comparison first (same budget as existing baseline):
+
+```bash
+bash scripts/run_cifar10_short_no_encoder.sh
+```
+
+Goal:
+- Decide whether short-budget CIFAR training is viable without a feature encoder in this implementation.
+- Compare this run’s FID curve directly against existing `configs/cifar10-short.yaml` baseline (`use_feature_encoder: true`).
+
+2. Then run LDF ablations:
+
+```bash
+bash scripts/run_ldf_verification.sh
+```
+
+This second script tests/ablates (single seed, short budget):
+- Learned field vs existing short kernel baseline (baseline already produced separately)
+- With projection vs without projection
+- Set-size sensitivity (`Npos/Nneg=16` vs `64`)

@@ -13,6 +13,7 @@ Drifting Models train a generator by computing a *drifting field* V that points 
 Key components:
 - **DiT-style generator** with adaLN-Zero conditioning
 - **Drifting field V** computed via soft assignment matrices (Algorithm 2)
+- **Learned Drifting Field (LDF)** option via antisymmetric set attention
 - **Multi-temperature** V computation for multi-scale structure
 - **Classifier-free guidance (CFG)** support
 
@@ -36,6 +37,26 @@ python train.py --dataset mnist
 
 # CIFAR-10 (with feature encoder)
 python train.py --dataset cifar10
+
+# CIFAR-10 with Learned Drifting Field (LDF)
+python train.py --dataset cifar10 --config configs/cifar10-ldf.yaml
+```
+
+### LDF Ablations
+
+```bash
+# Fixed kernel baseline (default)
+python train.py --dataset cifar10 --config configs/cifar10.yaml
+
+# Learned attention (with g() projection)
+python train.py --dataset cifar10 --config configs/cifar10-ldf.yaml
+
+# Learned attention (without g() projection)
+python train.py --dataset cifar10 --config configs/cifar10-ldf-no-proj.yaml
+
+# Set size sensitivity (Npos/Nneg)
+python train.py --dataset cifar10 --config configs/cifar10-ldf-setsize-small.yaml
+python train.py --dataset cifar10 --config configs/cifar10-ldf-setsize-large.yaml
 ```
 
 ### Sampling
@@ -90,4 +111,3 @@ CIFAR-10 samples after ~8500 steps:
 | LR | 2e-4 | 2e-4 |
 | Temperatures | [0.02, 0.05, 0.2] | [0.02, 0.05, 0.2] |
 | Feature space | Pixel (L2 norm) | CNN encoder |
-

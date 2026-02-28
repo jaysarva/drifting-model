@@ -18,6 +18,7 @@ from torchvision import datasets, transforms
 
 from model import DriftDiT_models
 from drifting import compute_V
+from learned_field import LearnedFieldBank
 from feature_encoder import create_feature_encoder
 from utils import (
     EMA,
@@ -52,6 +53,13 @@ MNIST_CONFIG = {
     "use_feature_encoder": False,  # Pixel space for MNIST
     "queue_size": 128,
     "label_dropout": 0.1,
+    "field_type": "kernel",  # "kernel" or "learned"
+    "kernel_use_multi_temperature": True,
+    "ldf_hidden_dim": 256,
+    "ldf_projection_dim": 256,
+    "ldf_score_hidden_dim": 128,
+    "ldf_use_projection": True,
+    "ldf_mask_self_neg": True,
 }
 
 CIFAR10_CONFIG = {
@@ -74,6 +82,13 @@ CIFAR10_CONFIG = {
     "use_feature_encoder": True,  # Use pretrained ResNet for feature space
     "queue_size": 128,
     "label_dropout": 0.1,
+    "field_type": "kernel",  # "kernel" or "learned"
+    "kernel_use_multi_temperature": True,
+    "ldf_hidden_dim": 256,
+    "ldf_projection_dim": 256,
+    "ldf_score_hidden_dim": 128,
+    "ldf_use_projection": True,
+    "ldf_mask_self_neg": True,
 }
 
 
@@ -217,6 +232,47 @@ def sample_batch(
     return x_pos, labels
 
 
+def infer_feature_dims(
+    config: Dict[str, Any],
+    feature_encoder: Optional[nn.Module],
+    device: torch.device,
+) -> list:
+    """Infer pooled feature dimensions for each training scale."""
+    if (not config["use_feature_encoder"]) or feature_encoder is None:
+        return [config["in_channels"] * config["img_size"] * config["img_size"]]
+
+    with torch.no_grad():
+        dummy = torch.zeros(
+            1,
+            config["in_channels"],
+            config["img_size"],
+            config["img_size"],
+            device=device,
+        )
+        feat_maps = feature_encoder(dummy)
+
+    if isinstance(feat_maps, torch.Tensor):
+        return [feat_maps.flatten(1).shape[1]]
+
+    return [F.adaptive_avg_pool2d(f, 1).flatten(1).shape[1] for f in feat_maps]
+
+
+def compute_feature_distance_stats(
+    feat_x: torch.Tensor,
+    feat_pos: torch.Tensor,
+    feat_neg: torch.Tensor,
+) -> Dict[str, float]:
+    """Compute pairwise feature distance stats used for logging."""
+    with torch.no_grad():
+        dist_pos = torch.cdist(feat_x, feat_pos, p=2)
+        dist_neg = torch.cdist(feat_x, feat_neg, p=2)
+        all_dists = torch.cat([dist_pos.reshape(-1), dist_neg.reshape(-1)], dim=0)
+        return {
+            "feature_dist_mean": all_dists.mean().item(),
+            "feature_dist_var": all_dists.var(unbiased=False).item(),
+        }
+
+
 def compute_drifting_loss(
     x_gen: torch.Tensor,
     labels_gen: torch.Tensor,
@@ -225,6 +281,10 @@ def compute_drifting_loss(
     feature_encoder: Optional[nn.Module],
     temperatures: list,
     use_pixel_space: bool = False,
+    field_type: str = "kernel",
+    kernel_use_multi_temperature: bool = True,
+    learned_field: Optional[LearnedFieldBank] = None,
+    ldf_mask_self_neg: bool = True,
 ) -> tuple:
     """
     Compute class-conditional drifting loss with multi-scale features.
@@ -239,12 +299,21 @@ def compute_drifting_loss(
         feature_encoder: Feature encoder (returns List[Tensor] for multi-scale)
         temperatures: List of temperatures for V computation
         use_pixel_space: Whether to use pixel space directly
+        field_type: Which field operator to use ("kernel" or "learned")
+        kernel_use_multi_temperature: Whether to use multi-temperature kernel V
+        learned_field: Learned field bank used when field_type == "learned"
+        ldf_mask_self_neg: Whether to mask self entries in the negative set
 
     Returns:
         loss: Scalar loss
         info: Dict with metrics
     """
     device = x_gen.device
+    field_type = field_type.lower()
+    if field_type not in {"kernel", "learned"}:
+        raise ValueError(f"Unknown field_type: {field_type}")
+    if len(temperatures) == 0:
+        raise ValueError("temperatures must contain at least one value")
     num_classes = labels_gen.max().item() + 1
 
     # Extract features
@@ -277,7 +346,7 @@ def compute_drifting_loss(
             continue
 
         # Compute loss at each scale
-        for feat_gen, feat_pos in zip(feat_gen_list, feat_pos_list):
+        for scale_idx, (feat_gen, feat_pos) in enumerate(zip(feat_gen_list, feat_pos_list)):
             feat_gen_c = feat_gen[mask_gen]
             feat_pos_c = feat_pos[mask_pos]
 
@@ -289,31 +358,56 @@ def compute_drifting_loss(
             feat_pos_c_norm = F.normalize(feat_pos_c, p=2, dim=1)
             feat_neg_c_norm = F.normalize(feat_neg_c, p=2, dim=1)
 
-            # Compute V with multiple temperatures
-            V_total = torch.zeros_like(feat_gen_c_norm)
-            dist_stats = None
-            for tau_idx, tau in enumerate(temperatures):
-                if tau_idx == 0:
-                    V_tau, dist_stats = compute_V(
+            if field_type == "learned":
+                if learned_field is None:
+                    raise ValueError("learned_field must be provided when field_type='learned'")
+                V_total = learned_field.compute_V_learned(
+                    scale_idx=scale_idx,
+                    feat_x=feat_gen_c_norm,
+                    feat_pos=feat_pos_c_norm,
+                    feat_neg=feat_neg_c_norm,
+                    mask_self_neg=ldf_mask_self_neg,
+                )
+                dist_stats = compute_feature_distance_stats(
+                    feat_gen_c_norm,
+                    feat_pos_c_norm,
+                    feat_neg_c_norm,
+                )
+            else:
+                if kernel_use_multi_temperature:
+                    V_total = torch.zeros_like(feat_gen_c_norm)
+                    dist_stats = None
+                    for tau_idx, tau in enumerate(temperatures):
+                        if tau_idx == 0:
+                            V_tau, dist_stats = compute_V(
+                                feat_gen_c_norm,
+                                feat_pos_c_norm,
+                                feat_neg_c_norm,
+                                tau,
+                                mask_self=True,  # y_neg = x, so mask self
+                                return_dist_stats=True,
+                            )
+                        else:
+                            V_tau = compute_V(
+                                feat_gen_c_norm,
+                                feat_pos_c_norm,
+                                feat_neg_c_norm,
+                                tau,
+                                mask_self=True,  # y_neg = x, so mask self
+                            )
+                        # Normalize each V before summing
+                        v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
+                        V_tau = V_tau / (v_norm + 1e-8)
+                        V_total = V_total + V_tau
+                else:
+                    V_total, dist_stats = compute_V(
                         feat_gen_c_norm,
                         feat_pos_c_norm,
                         feat_neg_c_norm,
-                        tau,
+                        temperatures[0],
                         mask_self=True,  # y_neg = x, so mask self
                         return_dist_stats=True,
                     )
-                else:
-                    V_tau = compute_V(
-                        feat_gen_c_norm,
-                        feat_pos_c_norm,
-                        feat_neg_c_norm,
-                        tau,
-                        mask_self=True,  # y_neg = x, so mask self
-                    )
-                # Normalize each V before summing
-                v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
-                V_tau = V_tau / (v_norm + 1e-8)
-                V_total = V_total + V_tau
 
             # Loss: MSE(phi(x), stopgrad(phi(x) + V))
             target = (feat_gen_c_norm + V_total).detach()
@@ -352,6 +446,7 @@ def train_step(
     config: dict,
     device: torch.device,
     feature_encoder: Optional[nn.Module] = None,
+    learned_field: Optional[LearnedFieldBank] = None,
 ) -> dict:
     """
     Single training step (Algorithm 1).
@@ -363,6 +458,8 @@ def train_step(
     5. Update model
     """
     model.train()
+    if learned_field is not None:
+        learned_field.train()
     num_classes = config["num_classes"]
     n_pos = config["batch_n_pos"]
     n_neg = config["batch_n_neg"]
@@ -370,6 +467,9 @@ def train_step(
     alpha_max = config["alpha_max"]
     temperatures = config["temperatures"]
     use_pixel = not config["use_feature_encoder"]
+    field_type = str(config.get("field_type", "kernel")).lower()
+    kernel_use_multi_temperature = bool(config.get("kernel_use_multi_temperature", True))
+    ldf_mask_self_neg = bool(config.get("ldf_mask_self_neg", True))
 
     # Total batch size
     batch_size = num_classes * n_neg
@@ -404,6 +504,10 @@ def train_step(
         feature_encoder,
         temperatures,
         use_pixel_space=use_pixel,
+        field_type=field_type,
+        kernel_use_multi_temperature=kernel_use_multi_temperature,
+        learned_field=learned_field,
+        ldf_mask_self_neg=ldf_mask_self_neg,
     )
 
     # Backward pass
@@ -411,8 +515,11 @@ def train_step(
     loss.backward()
 
     # Gradient clipping
+    params_to_clip = list(model.parameters())
+    if learned_field is not None:
+        params_to_clip.extend(list(learned_field.parameters()))
     grad_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), config["grad_clip"]
+        params_to_clip, config["grad_clip"]
     )
     info["grad_norm"] = grad_norm.item()
 
@@ -507,31 +614,6 @@ def train(
 
     print(f"Model: {config['model']}, Parameters: {count_parameters(model):,}")
 
-    # Create EMA
-    ema = EMA(model, decay=config["ema_decay"])
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        betas=(0.9, 0.95),
-        weight_decay=config["weight_decay"],
-    )
-
-    # Create scheduler
-    scheduler = WarmupLRScheduler(
-        optimizer,
-        warmup_steps=config["warmup_steps"],
-        base_lr=config["lr"],
-    )
-
-    # Create sample queue
-    queue = SampleQueue(
-        num_classes=config["num_classes"],
-        queue_size=config["queue_size"],
-        sample_shape=(config["in_channels"], config["img_size"], config["img_size"]),
-    )
-
     # Feature encoder (for CIFAR)
     feature_encoder = None
     if config["use_feature_encoder"]:
@@ -551,6 +633,58 @@ def train(
         for param in feature_encoder.parameters():
             param.requires_grad = False
 
+    # Field operator
+    field_type = str(config.get("field_type", "kernel")).lower()
+    if field_type not in {"kernel", "learned"}:
+        raise ValueError(f"Unknown field_type: {field_type}")
+    config["field_type"] = field_type
+
+    learned_field: Optional[LearnedFieldBank] = None
+    if field_type == "learned":
+        feature_dims = infer_feature_dims(config, feature_encoder, device)
+        learned_field = LearnedFieldBank(
+            feature_dims=feature_dims,
+            hidden_dim=int(config.get("ldf_hidden_dim", 256)),
+            projection_dim=config.get("ldf_projection_dim", 256),
+            score_hidden_dim=int(config.get("ldf_score_hidden_dim", 128)),
+            use_projection=bool(config.get("ldf_use_projection", True)),
+        ).to(device)
+        print(
+            "Using learned drifting field "
+            f"(dims={feature_dims}, use_projection={bool(config.get('ldf_use_projection', True))})"
+        )
+        config["kernel_use_multi_temperature"] = False
+    else:
+        learned_field = None
+
+    # Create EMA
+    ema = EMA(model, decay=config["ema_decay"])
+
+    # Create optimizer
+    optim_params = list(model.parameters())
+    if learned_field is not None:
+        optim_params.extend(list(learned_field.parameters()))
+    optimizer = torch.optim.AdamW(
+        optim_params,
+        lr=config["lr"],
+        betas=(0.9, 0.95),
+        weight_decay=config["weight_decay"],
+    )
+
+    # Create scheduler
+    scheduler = WarmupLRScheduler(
+        optimizer,
+        warmup_steps=config["warmup_steps"],
+        base_lr=config["lr"],
+    )
+
+    # Create sample queue
+    queue = SampleQueue(
+        num_classes=config["num_classes"],
+        queue_size=config["queue_size"],
+        sample_shape=(config["in_channels"], config["img_size"], config["img_size"]),
+    )
+
     # Resume from checkpoint
     start_epoch = 0
     global_step = 0
@@ -558,6 +692,14 @@ def train(
     last_epoch_metrics: Dict[str, float] = {}
     if resume:
         checkpoint = load_checkpoint(resume, model, ema, optimizer, scheduler)
+        if learned_field is not None:
+            if "learned_field" in checkpoint:
+                learned_field.load_state_dict(checkpoint["learned_field"])
+            else:
+                print(
+                    "Warning: resume checkpoint has no learned_field state; "
+                    "keeping newly initialized LDF weights."
+                )
         start_epoch = checkpoint["epoch"] + 1
         global_step = checkpoint["step"]
         if isinstance(checkpoint.get("metrics"), dict):
@@ -601,6 +743,7 @@ def train(
                 config,
                 device,
                 feature_encoder,
+                learned_field,
             )
 
             # Update EMA and scheduler
@@ -690,6 +833,11 @@ def train(
                     "step": last_step_metrics,
                     "epoch": last_epoch_metrics,
                 },
+                extra_state=(
+                    {"learned_field": learned_field.state_dict()}
+                    if learned_field is not None
+                    else None
+                ),
             )
             print(f"Saved checkpoint to {ckpt_path}")
 
@@ -720,6 +868,11 @@ def train(
             "step": last_step_metrics,
             "epoch": last_epoch_metrics,
         },
+        extra_state=(
+            {"learned_field": learned_field.state_dict()}
+            if learned_field is not None
+            else None
+        ),
     )
     logger.close()
     print(f"Training complete! Final checkpoint saved to {final_path}")

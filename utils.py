@@ -110,6 +110,7 @@ def save_checkpoint(
     step: int,
     config: Dict[str, Any],
     metrics: Optional[Dict[str, Any]] = None,
+    extra_state: Optional[Dict[str, Any]] = None,
 ):
     """Save training checkpoint."""
     checkpoint = {
@@ -123,6 +124,8 @@ def save_checkpoint(
     }
     if metrics is not None:
         checkpoint["metrics"] = metrics
+    if extra_state is not None:
+        checkpoint.update(extra_state)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
 
